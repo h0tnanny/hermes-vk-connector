@@ -13,20 +13,21 @@ Configuration via environment variables:
     VK_POLLING_TIMEOUT    Long Poll timeout in seconds (default: 25)
 
 Install dependencies:
-    pip install vk_api aiohttp
+    pip install vk_api
 """
 
 from __future__ import annotations
 
 import asyncio
 import io
+import json
 import logging
 import os
 import random
+import re
 import threading
-import time
 import urllib.request
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +69,34 @@ from gateway.config import Platform, PlatformConfig
 _CHAT_PEER_OFFSET = 2_000_000_000
 
 MAX_MESSAGE_LENGTH = 4096  # VK message character limit
+
+# ---------------------------------------------------------------------------
+# Persistent keyboard
+# ---------------------------------------------------------------------------
+
+_KEYBOARD_BUTTONS: List[List[Tuple[str, str]]] = [
+    [("🆕 Новый чат", "/new"), ("🔄 Сброс", "/reset")],
+]
+
+# Map button labels → slash commands so taps are treated as typed commands
+_LABEL_TO_COMMAND: Dict[str, str] = {
+    label: cmd for row in _KEYBOARD_BUTTONS for label, cmd in row
+}
+
+
+def _build_keyboard() -> str:
+    """Return a serialised VK persistent keyboard with navigation buttons."""
+    return json.dumps(
+        {
+            "one_time": False,
+            "buttons": [
+                [{"action": {"type": "text", "label": label}} for label, _ in row]
+                for row in _KEYBOARD_BUTTONS
+            ],
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +182,9 @@ class VKPlatformAdapter(BasePlatformAdapter):
         self._stop_flag = threading.Event()
         self._poll_thread: Optional[threading.Thread] = None
 
+        # Last sent message_id per chat — kept for future keyboard-edit use
+        self._last_msg_id: Dict[str, int] = {}
+
     @property
     def name(self) -> str:
         return "VKontakte"
@@ -195,11 +227,13 @@ class VKPlatformAdapter(BasePlatformAdapter):
         try:
             session = vk_api.VkApi(token=self.token, api_version=self.api_version)
             tools = session.get_api()
-            groups = tools.groups.getById()
-            if not groups:
+            # groups.getById() returns a list on 5.103+ but a dict on older versions
+            resp = tools.groups.getById()
+            groups_data = resp if isinstance(resp, list) else resp.get("groups", resp)
+            if not groups_data:
                 logger.error("VK: could not resolve group_id — check VK_TOKEN")
                 return None
-            group_id = int(groups[0]["id"])
+            group_id = int(groups_data[0]["id"])
             longpoll = VkBotLongPoll(session, group_id=group_id)
             return session, tools, longpoll, group_id
         except Exception as exc:
@@ -252,6 +286,9 @@ class VKPlatformAdapter(BasePlatformAdapter):
         peer_id = str(msg["peer_id"])
         from_id = str(msg["from_id"])
         text: str = msg.get("text") or ""
+
+        # Resolve persistent keyboard button taps to slash commands
+        text = _LABEL_TO_COMMAND.get(text, text)
 
         # Skip bot's own outbound echoes (negative from_id = community)
         if int(from_id) < 0:
@@ -351,22 +388,32 @@ class VKPlatformAdapter(BasePlatformAdapter):
     async def send(self, chat_id: str, text: str, **kwargs: Any) -> SendResult:
         if not text:
             return SendResult(success=True)
+        reply_to: Optional[str] = kwargs.get("reply_to")
+        text = _strip_markdown(text)
         chunks = _split_text(text, MAX_MESSAGE_LENGTH)
         last: SendResult = SendResult(success=True)
         for chunk in chunks:
-            last = await asyncio.to_thread(self._send_text_sync, chat_id, chunk)
+            last = await asyncio.to_thread(self._send_text_sync, chat_id, chunk, reply_to)
+            if last.success and last.message_id:
+                self._last_msg_id[chat_id] = int(last.message_id)
             if not last.success:
                 return last
         return last
 
-    def _send_text_sync(self, chat_id: str, text: str) -> SendResult:
+    def _send_text_sync(
+        self, chat_id: str, text: str, reply_to: Optional[str] = None
+    ) -> SendResult:
         try:
-            msg_id = self._vk_tools.messages.send(
+            params: Dict[str, Any] = dict(
                 peer_id=int(chat_id),
                 message=text,
                 random_id=random.randint(-2_000_000_000, 2_000_000_000),
                 dont_parse_links=0,
+                keyboard=_build_keyboard(),
             )
+            if reply_to is not None:
+                params["reply_to"] = int(reply_to)
+            msg_id = self._vk_tools.messages.send(**params)
             return SendResult(success=True, message_id=str(msg_id))
         except Exception as exc:
             logger.error("VK: send failed to peer_id=%s — %s", chat_id, exc)
@@ -385,19 +432,29 @@ class VKPlatformAdapter(BasePlatformAdapter):
     async def send_image(
         self, chat_id: str, image_url: str, caption: str = "", **kwargs: Any
     ) -> SendResult:
+        reply_to: Optional[str] = kwargs.get("reply_to")
         try:
             data = await asyncio.to_thread(
                 lambda: urllib.request.urlopen(image_url, timeout=30).read()
             )
-            return await asyncio.to_thread(
-                self._upload_photo_sync, chat_id, data, caption
+            result = await asyncio.to_thread(
+                self._upload_photo_sync, chat_id, data, caption, reply_to
             )
+            if result.success and result.message_id:
+                self._last_msg_id[chat_id] = int(result.message_id)
+            return result
         except Exception as exc:
             logger.error("VK: send_image failed — %s", exc)
             fallback = f"{caption}\n{image_url}".strip() if caption else image_url
             return await self.send(chat_id, fallback)
 
-    def _upload_photo_sync(self, chat_id: str, data: bytes, caption: str) -> SendResult:
+    def _upload_photo_sync(
+        self,
+        chat_id: str,
+        data: bytes,
+        caption: str,
+        reply_to: Optional[str] = None,
+    ) -> SendResult:
         upload = vk_api.VkUpload(self._vk)
         response = upload.photo_messages(photos=io.BytesIO(data))
         if not response:
@@ -405,12 +462,16 @@ class VKPlatformAdapter(BasePlatformAdapter):
         photo = response[0]
         attachment = f"photo{photo['owner_id']}_{photo['id']}"
         try:
-            msg_id = self._vk_tools.messages.send(
+            params: Dict[str, Any] = dict(
                 peer_id=int(chat_id),
                 message=caption or "",
                 attachment=attachment,
                 random_id=random.randint(-2_000_000_000, 2_000_000_000),
+                keyboard=_build_keyboard(),
             )
+            if reply_to is not None:
+                params["reply_to"] = int(reply_to)
+            msg_id = self._vk_tools.messages.send(**params)
             return SendResult(success=True, message_id=str(msg_id))
         except Exception as exc:
             return SendResult(success=False, error=str(exc))
@@ -418,52 +479,66 @@ class VKPlatformAdapter(BasePlatformAdapter):
     async def send_document(
         self, chat_id: str, file_path: str, caption: str = "", **kwargs: Any
     ) -> SendResult:
+        reply_to: Optional[str] = kwargs.get("reply_to")
         try:
-            return await asyncio.to_thread(
-                self._upload_doc_sync, chat_id, file_path, caption
+            result = await asyncio.to_thread(
+                self._upload_doc_sync, chat_id, file_path, caption, reply_to
             )
+            if result.success and result.message_id:
+                self._last_msg_id[chat_id] = int(result.message_id)
+            return result
         except Exception as exc:
             logger.error("VK: send_document failed — %s", exc)
             return SendResult(success=False, error=str(exc))
 
-    def _upload_doc_sync(self, chat_id: str, file_path: str, caption: str) -> SendResult:
+    def _upload_doc_sync(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: str,
+        reply_to: Optional[str] = None,
+    ) -> SendResult:
         upload = vk_api.VkUpload(self._vk)
         title = caption or os.path.basename(file_path)
         with open(file_path, "rb") as fh:
             doc_bytes = io.BytesIO(fh.read())
-        doc_bytes.name = title  # vk_api uses .name to set the filename
-        response = upload.document_message(
-            doc=doc_bytes,
-            peer_id=int(chat_id),
-            title=title,
-        )
+        doc_bytes.name = title  # vk_api uses .name to set the filename on upload
+        response = upload.document_message(doc=doc_bytes, peer_id=int(chat_id), title=title)
         if not response or "doc" not in response:
             return SendResult(success=False, error="Document upload failed")
         doc = response["doc"]
         attachment = f"doc{doc['owner_id']}_{doc['id']}"
         try:
-            msg_id = self._vk_tools.messages.send(
+            params: Dict[str, Any] = dict(
                 peer_id=int(chat_id),
                 message="",
                 attachment=attachment,
                 random_id=random.randint(-2_000_000_000, 2_000_000_000),
+                keyboard=_build_keyboard(),
             )
+            if reply_to is not None:
+                params["reply_to"] = int(reply_to)
+            msg_id = self._vk_tools.messages.send(**params)
             return SendResult(success=True, message_id=str(msg_id))
         except Exception as exc:
             return SendResult(success=False, error=str(exc))
 
-    async def send_voice(
-        self, chat_id: str, audio_path: str, **kwargs: Any
-    ) -> SendResult:
+    async def send_voice(self, chat_id: str, audio_path: str, **kwargs: Any) -> SendResult:
+        reply_to: Optional[str] = kwargs.get("reply_to")
         try:
-            return await asyncio.to_thread(
-                self._upload_voice_sync, chat_id, audio_path
+            result = await asyncio.to_thread(
+                self._upload_voice_sync, chat_id, audio_path, reply_to
             )
+            if result.success and result.message_id:
+                self._last_msg_id[chat_id] = int(result.message_id)
+            return result
         except Exception as exc:
             logger.error("VK: send_voice failed — %s", exc)
             return SendResult(success=False, error=str(exc))
 
-    def _upload_voice_sync(self, chat_id: str, audio_path: str) -> SendResult:
+    def _upload_voice_sync(
+        self, chat_id: str, audio_path: str, reply_to: Optional[str] = None
+    ) -> SendResult:
         upload = vk_api.VkUpload(self._vk)
         response = upload.audio_message(audio=audio_path, peer_id=int(chat_id))
         if not response or "audio_message" not in response:
@@ -471,12 +546,16 @@ class VKPlatformAdapter(BasePlatformAdapter):
         am = response["audio_message"]
         attachment = f"audio_message{am['owner_id']}_{am['id']}"
         try:
-            msg_id = self._vk_tools.messages.send(
+            params: Dict[str, Any] = dict(
                 peer_id=int(chat_id),
                 message="",
                 attachment=attachment,
                 random_id=random.randint(-2_000_000_000, 2_000_000_000),
+                keyboard=_build_keyboard(),
             )
+            if reply_to is not None:
+                params["reply_to"] = int(reply_to)
+            msg_id = self._vk_tools.messages.send(**params)
             return SendResult(success=True, message_id=str(msg_id))
         except Exception as exc:
             return SendResult(success=False, error=str(exc))
@@ -511,6 +590,36 @@ class VKPlatformAdapter(BasePlatformAdapter):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _strip_markdown(text: str) -> str:
+    """Strip common Markdown so VK renders plain text cleanly."""
+    # Fenced code blocks — remove backticks, keep content
+    text = re.sub(r"```[\s\S]*?```", lambda m: m.group(0).replace("```", ""), text)
+    # Inline code
+    text = re.sub(r"(?<!`)`(?!`)([^`]+)`(?!`)", r"\1", text)
+    # Bold / italic
+    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
+    text = re.sub(r"(?<!\*)\*([^*\n]+?)\*(?!\*)", r"\1", text)
+    text = re.sub(r"__(.+?)__", r"\1", text)
+    text = re.sub(r"(?<!_)_([^_\n]+?)_(?!_)", r"\1", text)
+    # Links: [text](url) → text (url)
+    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1 (\2)", text)
+    # Headings
+    text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
+    # Unordered lists
+    text = re.sub(r"^[\s]*[-*+]\s+", "• ", text, flags=re.MULTILINE)
+    # Ordered lists
+    text = re.sub(r"^(\s*)\d+\.\s+", r"\1", text, flags=re.MULTILINE)
+    # Blockquotes
+    text = re.sub(r"^>\s?", "", text, flags=re.MULTILINE)
+    # Horizontal rules
+    text = re.sub(r"^[-*_]{3,}\s*$", "—", text, flags=re.MULTILINE)
+    # Strikethrough
+    text = re.sub(r"~~(.+?)~~", r"\1", text)
+    # Collapse excess blank lines
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 
 def _split_text(text: str, limit: int) -> List[str]:
