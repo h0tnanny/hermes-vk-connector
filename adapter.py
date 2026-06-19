@@ -140,7 +140,7 @@ class VKPlatformAdapter(BasePlatformAdapter):
         else:
             self._allowed_users = {u.strip() for u in str(raw_allowed).split(",") if u.strip()}
 
-        self.home_channel: Optional[str] = (
+        self._home_channel: Optional[str] = (
             os.getenv("VK_HOME_CHANNEL") or str(extra.get("home_channel", "")) or None
         )
 
@@ -156,6 +156,10 @@ class VKPlatformAdapter(BasePlatformAdapter):
     @property
     def name(self) -> str:
         return "VKontakte"
+
+    @property
+    def home_channel(self) -> Optional[str]:
+        return self._home_channel
 
     # ── Authorization ────────────────────────────────────────────────────
 
@@ -287,6 +291,7 @@ class VKPlatformAdapter(BasePlatformAdapter):
                 logger.warning("VK: failed to cache attachment type=%s — %s", att_type, exc)
 
         source = self.build_source(
+            platform="vkontakte",
             chat_id=peer_id,
             chat_name=chat_name,
             chat_type=chat_type,
@@ -423,10 +428,14 @@ class VKPlatformAdapter(BasePlatformAdapter):
 
     def _upload_doc_sync(self, chat_id: str, file_path: str, caption: str) -> SendResult:
         upload = vk_api.VkUpload(self._vk)
+        title = caption or os.path.basename(file_path)
+        with open(file_path, "rb") as fh:
+            doc_bytes = io.BytesIO(fh.read())
+        doc_bytes.name = title  # vk_api uses .name to set the filename
         response = upload.document_message(
-            doc=file_path,
+            doc=doc_bytes,
             peer_id=int(chat_id),
-            title=caption or os.path.basename(file_path),
+            title=title,
         )
         if not response or "doc" not in response:
             return SendResult(success=False, error="Document upload failed")

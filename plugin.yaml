@@ -7,6 +7,11 @@ description: >
   Connects to a VK community bot via Long Poll API and relays
   messages between VK users and the Hermes agent.
 author: community
+# Tell the Gateway which env vars carry the allowlist so authz_mixin.py
+# can gate messages before they reach the adapter.
+allowed_users_env: VK_ALLOWED_USERS
+allow_all_env: VK_ALLOW_ALL_USERS
+cron_deliver_env_var: VK_HOME_CHANNEL
 requires_env:
   - name: VK_TOKEN
     description: "VK Community API token with messages permission (Manage community → API usage → Create token)"
